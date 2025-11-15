@@ -43,3 +43,12 @@ def predict():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/debug-model")
+def debug_model():
+    with open("risk_model.pkl", "rb") as f:
+        bundle = pickle.load(f)
+    return {"type": str(type(bundle)), 
+            "keys": list(bundle.keys()) if isinstance(bundle, dict) else "no keys"}
+
