@@ -7,7 +7,17 @@ app = Flask(__name__)
 
 # Load your model
 with open("risk_model.pkl", "rb") as f:
-    model = pickle.load(f)
+    bundle = pickle.load(f)
+
+    if "pipeline" in bundle:
+        model = bundle["pipeline"]
+    
+    elif "model" in bundle:
+        model = bundle["model"]
+    
+    else:
+        raise Exception(f"Could not find model inside keys: {bundle.keys()}")
+    
 
 @app.route("/")
 def health():
