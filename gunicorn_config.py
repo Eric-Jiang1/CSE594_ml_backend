@@ -14,8 +14,9 @@ backlog = 2048
 workers = 1  # Use 1 worker on free tier to avoid memory issues
 worker_class = "sync"
 worker_connections = 1000
-timeout = 120  # Increased timeout for SHAP computations (2 minutes)
+timeout = 180  # Increased timeout for SHAP computations (3 minutes) - Render may still limit to 30s
 keepalive = 5
+graceful_timeout = 30  # Time to wait for workers to finish before killing
 
 # Logging
 accesslog = "-"  # Log to stdout

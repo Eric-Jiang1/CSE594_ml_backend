@@ -45,11 +45,26 @@ The API was experiencing worker timeouts on Render's free tier due to SHAP compu
 
 ## Environment Variables
 
-Optional environment variables:
-- `SHAP_MAX_BACKGROUND`: Maximum background samples for SHAP (default: 100)
+**Required for free tier:**
+- `SHAP_MAX_BACKGROUND=10`: Maximum background samples for SHAP (default: 10 for free tier)
+- `MAX_SHAP_RECORDS=1`: Maximum records per SHAP request (default: 1)
+
+**⚠️ IMPORTANT:** Render's free tier has a **hard 30-second timeout** that cannot be overridden. Even with optimizations, SHAP may still timeout. Consider:
+1. Setting `SHAP_MAX_BACKGROUND=5` for even faster computation
+2. Using `/predict` endpoint instead of `/explain`
+3. Upgrading to a paid Render tier
+4. Disabling SHAP on free tier entirely
+
+**Optional:**
 - `LOG_LEVEL`: Logging level (default: info)
 - `CKD_MODEL_PATH`: Path to model file (default: risk_model.pkl)
 - `PORT`: Server port (auto-set by Render)
+
+**Important:** On Render's free tier, set these in your service settings:
+```
+SHAP_MAX_BACKGROUND=25
+MAX_SHAP_RECORDS=1
+```
 
 ## Performance Optimization
 
@@ -75,16 +90,29 @@ Check Render logs for:
 
 ### Still Getting Timeouts?
 
-1. **Reduce SHAP background further:**
+1. **Reduce SHAP background further (already set to 25 by default):**
    ```bash
-   SHAP_MAX_BACKGROUND=50
+   SHAP_MAX_BACKGROUND=10  # Even more aggressive
    ```
 
-2. **Disable SHAP entirely for testing:**
+2. **Limit SHAP to single records:**
+   ```bash
+   MAX_SHAP_RECORDS=1  # Already default
+   ```
+
+3. **Use /predict instead of /explain:**
+   - `/predict` with `include_shap: true` has the same functionality
+   - May have better error handling
+
+4. **Disable SHAP entirely for testing:**
    - Don't set `include_shap: true` in requests
    - Or remove SHAP explainer from model bundle
 
-3. **Check memory usage:**
+5. **Check Render's actual timeout limit:**
+   - Free tier may have hard 30-second limit regardless of gunicorn config
+   - Consider upgrading to paid tier for longer timeouts
+
+6. **Check memory usage:**
    - Free tier has 512MB RAM limit
    - Monitor in Render dashboard
 

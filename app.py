@@ -104,10 +104,11 @@ if isinstance(model_dict, dict):
     shap_background = model_dict.get("shap_background", None)
     
     # Optimize SHAP explainer for production if background data is large
+    # Use very small background for free tier to avoid timeouts
     if shap_explainer is not None and shap_background is not None and raw_tree_model is not None:
         try:
-            # Reduce background data size if it's too large (for faster computation)
-            max_background_samples = int(os.environ.get("SHAP_MAX_BACKGROUND", "100"))
+            # Reduce background data size aggressively for free tier (default: 10 samples)
+            max_background_samples = int(os.environ.get("SHAP_MAX_BACKGROUND", "10"))
             if hasattr(shap_background, 'shape') and shap_background.shape[0] > max_background_samples:
                 import random
                 random.seed(42)  # For reproducibility
@@ -440,8 +441,8 @@ def predict():
 @app.route("/explain", methods=["POST"])
 def explain():
     """
-    Get SHAP explanations for input records.
-    This endpoint focuses specifically on feature importance explanations.
+    Get simplified SHAP explanations: stage, confidence, and key contributing factors.
+    This endpoint is optimized to only compute SHAP for the predicted class (faster).
     """
     if shap_explainer is None:
         return jsonify({"error": "SHAP explainer not available in model"}), 400
@@ -450,39 +451,14 @@ def explain():
         records = _prepare_records(request.get_json(force=True, silent=False))
         df = _build_dataframe(records)
 
-        # Compute SHAP values (optimized for production)
-        shap_values_raw = shap_explainer.shap_values(
-            df.values,
-            check_additivity=False  # Skip validation for speed
-        )
-        
-        # Handle different SHAP output formats
-        # Format 1: List of arrays (one per class) - shape: [class][sample][feature]
-        # Format 2: 3D numpy array - shape: (samples, features, classes)
-        # Format 3: 2D numpy array - shape: (samples, features) for binary
-        if isinstance(shap_values_raw, list):
-            # Convert list of arrays to list of lists
-            shap_values = [sv.tolist() if hasattr(sv, 'tolist') else sv for sv in shap_values_raw]
-            shap_format = 'list'
-        elif isinstance(shap_values_raw, np.ndarray):
-            if len(shap_values_raw.shape) == 3:
-                # 3D array: (samples, features, classes) - need to transpose
-                # Convert to list format: [class][sample][feature]
-                shap_values = []
-                n_samples, n_features, n_classes = shap_values_raw.shape
-                for class_idx in range(n_classes):
-                    class_shap = shap_values_raw[:, :, class_idx].tolist()
-                    shap_values.append(class_shap)
-                shap_format = '3d_array'
-            else:
-                # 2D array: (samples, features) - binary classification
-                shap_values = shap_values_raw.tolist()
-                shap_format = '2d_array'
-        else:
-            shap_values = shap_values_raw
-            shap_format = 'unknown'
-        
-        # Get predictions for context
+        # Limit number of records for SHAP computation to avoid timeouts
+        max_shap_records = int(os.environ.get("MAX_SHAP_RECORDS", "1"))
+        if len(records) > max_shap_records:
+            return jsonify({
+                "error": f"Too many records for SHAP computation. Maximum {max_shap_records} record(s) allowed."
+            }), 400
+
+        # Get predictions first (fast)
         predictions = model.predict(df).tolist()
         probabilities = None
         if hasattr(model, "predict_proba"):
@@ -491,105 +467,96 @@ def explain():
             except Exception:
                 pass
 
+        # Compute SHAP values only for predicted class (much faster than all classes)
+        # Note: Render free tier has 30s hard timeout
+        try:
+            shap_values_raw = shap_explainer.shap_values(
+                df.values,
+                check_additivity=False  # Skip validation for speed
+            )
+        except Exception as shap_err:
+            error_msg = str(shap_err)
+            if "timeout" in error_msg.lower() or "time" in error_msg.lower():
+                return jsonify({
+                    "error": "SHAP computation timed out. Set SHAP_MAX_BACKGROUND=5 or upgrade Render tier."
+                }), 504
+            else:
+                return jsonify({
+                    "error": f"SHAP computation failed: {error_msg}"
+                }), 500
+        
+        # Handle different SHAP output formats and extract only predicted class
+        if isinstance(shap_values_raw, list):
+            shap_values = [sv.tolist() if hasattr(sv, 'tolist') else sv for sv in shap_values_raw]
+        elif isinstance(shap_values_raw, np.ndarray):
+            if len(shap_values_raw.shape) == 3:
+                # 3D array: (samples, features, classes) - convert to list format
+                n_samples, n_features, n_classes = shap_values_raw.shape
+                shap_values = []
+                for class_idx in range(n_classes):
+                    class_shap = shap_values_raw[:, :, class_idx].tolist()
+                    shap_values.append(class_shap)
+            else:
+                shap_values = shap_values_raw.tolist()
+        else:
+            shap_values = shap_values_raw
+
         results = []
         for idx, record in enumerate(records):
-            result: Dict[str, Any] = {
-                "input": record,
-                "prediction": predictions[idx],
-            }
+            pred_idx = int(predictions[idx])
             
-            # Decode prediction label
-            if encoder is not None and isinstance(predictions[idx], (int, np.integer)):
+            # Get prediction label
+            prediction_label = None
+            if encoder is not None:
                 try:
-                    decoded = encoder.inverse_transform([[predictions[idx]]])[0][0]
-                    result["prediction_label"] = decoded
+                    prediction_label = encoder.inverse_transform([[pred_idx]])[0][0]
                 except Exception:
                     pass
             
-            if probabilities and idx < len(probabilities):
-                result["probabilities"] = probabilities[idx]
-                pred_idx = int(predictions[idx])
-                if pred_idx < len(probabilities[idx]):
-                    result["confidence"] = float(probabilities[idx][pred_idx])
+            # Get confidence
+            confidence = None
+            if probabilities and idx < len(probabilities) and pred_idx < len(probabilities[idx]):
+                confidence = float(probabilities[idx][pred_idx])
             
-            # Process SHAP values
-            if isinstance(shap_values, list):
-                # Multi-class: get SHAP for predicted class and all classes
-                pred_idx = int(predictions[idx])
-                
-                # SHAP values for predicted class
-                if pred_idx < len(shap_values) and idx < len(shap_values[pred_idx]):
-                    pred_shap = shap_values[pred_idx][idx]
-                    # Ensure pred_shap is a list/array we can index
-                    if isinstance(pred_shap, (list, np.ndarray)):
-                        feature_importance = {}
-                        if FEATURE_NAMES is not None:
-                            for feat_idx, feat_name in enumerate(FEATURE_NAMES):
-                                if feat_idx < len(pred_shap):
-                                    # Convert to Python native type first
-                                    val = pred_shap[feat_idx]
-                                    if isinstance(val, (np.ndarray, np.generic)):
-                                        val = val.item() if val.size == 1 else float(val)
-                                    else:
-                                        val = float(val)
-                                    feature_importance[feat_name] = val
-                        result["shap_values"] = feature_importance
-                        
-                        # Sort by absolute importance
-                        result["feature_importance"] = sorted(
-                            feature_importance.items(),
-                            key=lambda x: abs(x[1]),
-                            reverse=True
-                        )
-                
-                # SHAP values for all classes
-                all_classes_shap = {}
-                if CLASS_LABELS is not None and encoder is not None:
-                    for class_idx in range(len(shap_values)):
-                        if idx < len(shap_values[class_idx]):
-                            class_shap = shap_values[class_idx][idx]
-                            class_label = None
-                            try:
-                                class_label = encoder.inverse_transform([[class_idx]])[0][0]
-                            except Exception:
-                                class_label = f"class_{class_idx}"
-                            
-                            class_feature_importance = {}
-                            if FEATURE_NAMES is not None and isinstance(class_shap, (list, np.ndarray)):
-                                for feat_idx, feat_name in enumerate(FEATURE_NAMES):
-                                    if feat_idx < len(class_shap):
-                                        # Convert to Python native type first
-                                        val = class_shap[feat_idx]
-                                        if isinstance(val, (np.ndarray, np.generic)):
-                                            val = val.item() if val.size == 1 else float(val)
-                                        else:
-                                            val = float(val)
-                                        class_feature_importance[feat_name] = val
-                            
-                            all_classes_shap[class_label] = class_feature_importance
-                
-                result["shap_values_all_classes"] = all_classes_shap
-            else:
-                # Binary or single output
-                if idx < len(shap_values):
-                    record_shap = shap_values[idx]
+            # Get SHAP values for predicted class only
+            contributing_factors = []
+            if isinstance(shap_values, list) and pred_idx < len(shap_values) and idx < len(shap_values[pred_idx]):
+                pred_shap = shap_values[pred_idx][idx]
+                if isinstance(pred_shap, (list, np.ndarray)) and FEATURE_NAMES is not None:
+                    # Build feature importance dict
                     feature_importance = {}
-                    if FEATURE_NAMES is not None and isinstance(record_shap, (list, np.ndarray)):
-                        for feat_idx, feat_name in enumerate(FEATURE_NAMES):
-                            if feat_idx < len(record_shap):
-                                # Convert to Python native type first
-                                val = record_shap[feat_idx]
-                                if isinstance(val, (np.ndarray, np.generic)):
-                                    val = val.item() if val.size == 1 else float(val)
-                                else:
-                                    val = float(val)
-                                feature_importance[feat_name] = val
-                    result["shap_values"] = feature_importance
-                    result["feature_importance"] = sorted(
+                    for feat_idx, feat_name in enumerate(FEATURE_NAMES):
+                        if feat_idx < len(pred_shap):
+                            val = pred_shap[feat_idx]
+                            if isinstance(val, (np.ndarray, np.generic)):
+                                val = val.item() if val.size == 1 else float(val)
+                            else:
+                                val = float(val)
+                            feature_importance[feat_name] = val
+                    
+                    # Sort by absolute importance and get top factors
+                    sorted_factors = sorted(
                         feature_importance.items(),
                         key=lambda x: abs(x[1]),
                         reverse=True
                     )
+                    
+                    # Return top contributing factors (all factors, but sorted)
+                    contributing_factors = [
+                        {
+                            "feature": feat_name,
+                            "value": float(shap_val),
+                            "impact": "increases" if shap_val > 0 else "decreases"
+                        }
+                        for feat_name, shap_val in sorted_factors
+                    ]
+            
+            # Return simplified response
+            result = {
+                "stage": prediction_label,
+                "confidence": confidence,
+                "contributing_factors": contributing_factors
+            }
             
             results.append(result)
 
@@ -597,4 +564,4 @@ def explain():
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
     except Exception as exc:
-        return jsonify({"error": f"SHAP explanation failed: {exc}"}), 500
+        return jsonify({"error": f"Explanation failed: {exc}"}), 500
