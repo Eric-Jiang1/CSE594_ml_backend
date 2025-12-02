@@ -441,8 +441,8 @@ def predict():
 @app.route("/explain", methods=["POST"])
 def explain():
     """
-    Get simplified SHAP explanations: stage, confidence, and key contributing factors.
-    This endpoint is optimized to only compute SHAP for the predicted class (faster).
+    Get SHAP explanations: stage, confidence, and top 3 most relevant features.
+    Accepts one or multiple patient records.
     """
     if shap_explainer is None:
         return jsonify({"error": "SHAP explainer not available in model"}), 400
@@ -450,13 +450,6 @@ def explain():
     try:
         records = _prepare_records(request.get_json(force=True, silent=False))
         df = _build_dataframe(records)
-
-        # Limit number of records for SHAP computation to avoid timeouts
-        max_shap_records = int(os.environ.get("MAX_SHAP_RECORDS", "1"))
-        if len(records) > max_shap_records:
-            return jsonify({
-                "error": f"Too many records for SHAP computation. Maximum {max_shap_records} record(s) allowed."
-            }), 400
 
         # Get predictions first (fast)
         predictions = model.predict(df).tolist()
@@ -467,8 +460,8 @@ def explain():
             except Exception:
                 pass
 
-        # Compute SHAP values only for predicted class (much faster than all classes)
-        # Note: Render free tier has 30s hard timeout
+        # Compute SHAP values
+        # Note: Render free tier has 30s hard timeout - may fail with many records
         try:
             shap_values_raw = shap_explainer.shap_values(
                 df.values,
@@ -478,14 +471,14 @@ def explain():
             error_msg = str(shap_err)
             if "timeout" in error_msg.lower() or "time" in error_msg.lower():
                 return jsonify({
-                    "error": "SHAP computation timed out. Set SHAP_MAX_BACKGROUND=5 or upgrade Render tier."
+                    "error": "SHAP computation timed out. Try fewer records or set SHAP_MAX_BACKGROUND=5."
                 }), 504
             else:
                 return jsonify({
                     "error": f"SHAP computation failed: {error_msg}"
                 }), 500
         
-        # Handle different SHAP output formats and extract only predicted class
+        # Handle different SHAP output formats
         if isinstance(shap_values_raw, list):
             shap_values = [sv.tolist() if hasattr(sv, 'tolist') else sv for sv in shap_values_raw]
         elif isinstance(shap_values_raw, np.ndarray):
@@ -505,21 +498,21 @@ def explain():
         for idx, record in enumerate(records):
             pred_idx = int(predictions[idx])
             
-            # Get prediction label
-            prediction_label = None
+            # Get prediction label (stage)
+            stage = None
             if encoder is not None:
                 try:
-                    prediction_label = encoder.inverse_transform([[pred_idx]])[0][0]
+                    stage = encoder.inverse_transform([[pred_idx]])[0][0]
                 except Exception:
                     pass
             
-            # Get confidence
+            # Get confidence score
             confidence = None
             if probabilities and idx < len(probabilities) and pred_idx < len(probabilities[idx]):
                 confidence = float(probabilities[idx][pred_idx])
             
-            # Get SHAP values for predicted class only
-            contributing_factors = []
+            # Get top 3 most relevant features from SHAP
+            top_features = []
             if isinstance(shap_values, list) and pred_idx < len(shap_values) and idx < len(shap_values[pred_idx]):
                 pred_shap = shap_values[pred_idx][idx]
                 if isinstance(pred_shap, (list, np.ndarray)) and FEATURE_NAMES is not None:
@@ -534,28 +527,21 @@ def explain():
                                 val = float(val)
                             feature_importance[feat_name] = val
                     
-                    # Sort by absolute importance and get top factors
+                    # Sort by absolute importance and get top 3
                     sorted_factors = sorted(
                         feature_importance.items(),
                         key=lambda x: abs(x[1]),
                         reverse=True
                     )
                     
-                    # Return top contributing factors (all factors, but sorted)
-                    contributing_factors = [
-                        {
-                            "feature": feat_name,
-                            "value": float(shap_val),
-                            "impact": "increases" if shap_val > 0 else "decreases"
-                        }
-                        for feat_name, shap_val in sorted_factors
-                    ]
+                    # Return only top 3 feature names
+                    top_features = [feat_name for feat_name, _ in sorted_factors[:3]]
             
-            # Return simplified response
+            # Return response: stage, confidence, top 3 features
             result = {
-                "stage": prediction_label,
+                "stage": stage,
                 "confidence": confidence,
-                "contributing_factors": contributing_factors
+                "top_features": top_features
             }
             
             results.append(result)
