@@ -179,6 +179,46 @@ MODEL_INFO = {
 }
 
 
+def calc_egfr(creatinine: float, age: float, sex: int) -> float:
+    """
+    Calculate eGFR using CKD-EPI 2021 formula.
+    
+    Args:
+        creatinine: Serum creatinine (mg/dL)
+        age: Patient age (years)
+        sex: 0 = Female, 1 = Male
+    
+    Returns:
+        eGFR value (mL/min/1.73m²)
+    """
+    # Handle NaN or None values
+    if pd.isna(creatinine) or pd.isna(age) or pd.isna(sex):
+        return np.nan
+    
+    # Convert to numpy arrays for vectorized operations
+    creatinine = np.array(creatinine)
+    age = np.array(age)
+    sex = np.array(sex)
+    
+    # CKD-EPI 2021 formula parameters
+    k = np.where(sex == 1, 0.7, 0.9)
+    alpha = np.where(sex == 1, -0.241, -0.302)
+    sex_factor = np.where(sex == 1, 1.012, 1.0)
+    
+    scr_k = creatinine / k
+    egfr = (
+        142 * np.minimum(scr_k, 1)**alpha *
+        np.maximum(scr_k, 1)**(-1.200) *
+        (0.9938**age) *
+        sex_factor
+    )
+    
+    # Return scalar if input was scalar, otherwise array
+    if np.isscalar(creatinine):
+        return float(egfr)
+    return egfr
+
+
 def _get_shap_class_index(pred_stage: str) -> Optional[int]:
     """
     Find the correct SHAP output index for a given CKD stage label.
@@ -535,6 +575,39 @@ def explain():
             if probabilities and idx < len(probabilities) and pred_idx < len(probabilities[idx]):
                 confidence = float(probabilities[idx][pred_idx])
             
+            # Calculate eGFR using the same values the model used for prediction
+            # (original values if available, otherwise imputed values from the dataframe)
+            egfr = None
+            try:
+                # First try original values from the record
+                sc = record.get("sc") or record.get("serum_creatinine")
+                age = record.get("age")
+                sex = record.get("sex")
+                
+                # If any are missing, use imputed values from the dataframe (what model actually used)
+                if sc is None or pd.isna(sc) or age is None or pd.isna(age) or sex is None or pd.isna(sex):
+                    # Get imputed values from the processed dataframe
+                    if idx < len(df) and FEATURE_NAMES is not None:
+                        df_row = df.iloc[idx]
+                        if sc is None or pd.isna(sc):
+                            sc = df_row.get("sc", None)
+                        if age is None or pd.isna(age):
+                            age = df_row.get("age", None)
+                        if sex is None or pd.isna(sex):
+                            sex = df_row.get("sex", None)
+                
+                # Calculate eGFR if we have all required values (original or imputed)
+                if sc is not None and not pd.isna(sc) and age is not None and not pd.isna(age) and sex is not None and not pd.isna(sex):
+                    egfr = calc_egfr(float(sc), float(age), int(sex))
+                    # Round to 2 decimal places
+                    if not pd.isna(egfr):
+                        egfr = round(float(egfr), 2)
+                    else:
+                        egfr = None
+            except (ValueError, TypeError, KeyError, IndexError) as e:
+                # If calculation fails, egfr remains None
+                pass
+            
             # Get top 3 most relevant features from SHAP
             top_features = []
             if isinstance(shap_values, list) and pred_idx < len(shap_values) and idx < len(shap_values[pred_idx]):
@@ -561,10 +634,11 @@ def explain():
                     # Return only top 3 feature names
                     top_features = [feat_name for feat_name, _ in sorted_factors[:3]]
             
-            # Return response: stage, confidence, top 3 features
+            # Return response: stage, confidence, egfr, top 3 features
             result = {
                 "stage": stage,
                 "confidence": confidence,
+                "egfr": egfr,
                 "top_features": top_features
             }
             
