@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ckd-prediction-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --config gunicorn_config.py
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: CKD_MODEL_PATH
+        value: risk_model.pkl
+      - key: LOG_LEVEL
+        value: info
+

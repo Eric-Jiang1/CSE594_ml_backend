@@ -102,6 +102,30 @@ if isinstance(model_dict, dict):
     shap_explainer = model_dict.get("shap_explainer", None)
     raw_tree_model = model_dict.get("raw_tree_model", None)
     shap_background = model_dict.get("shap_background", None)
+    
+    # Optimize SHAP explainer for production if background data is large
+    if shap_explainer is not None and shap_background is not None and raw_tree_model is not None:
+        try:
+            # Reduce background data size if it's too large (for faster computation)
+            max_background_samples = int(os.environ.get("SHAP_MAX_BACKGROUND", "100"))
+            if hasattr(shap_background, 'shape') and shap_background.shape[0] > max_background_samples:
+                import random
+                random.seed(42)  # For reproducibility
+                sample_indices = random.sample(
+                    range(shap_background.shape[0]),
+                    min(max_background_samples, shap_background.shape[0])
+                )
+                shap_background_reduced = shap_background[sample_indices]
+                # Recreate explainer with reduced background
+                try:
+                    shap_explainer = shap.TreeExplainer(raw_tree_model, data=shap_background_reduced)
+                    print(f"Optimized SHAP explainer: reduced background from {shap_background.shape[0]} to {shap_background_reduced.shape[0]} samples")
+                except Exception as e:
+                    print(f"Warning: Could not optimize SHAP explainer: {e}")
+                    # Keep original explainer
+        except Exception as e:
+            print(f"Warning: SHAP optimization check failed: {e}")
+            # Continue with original explainer
     # Try different possible keys for feature list
     feature_list = (
         model_dict.get("feature_cols") or 
@@ -314,7 +338,13 @@ def predict():
         shap_values = None
         if include_shap and shap_explainer is not None:
             try:
-                shap_values_raw = shap_explainer.shap_values(df.values)
+                # Optimize SHAP computation for production environments
+                # Skip additivity check for faster computation
+                shap_values_raw = shap_explainer.shap_values(
+                    df.values,
+                    check_additivity=False  # Skip validation for speed
+                )
+                
                 # Handle different SHAP output formats
                 if isinstance(shap_values_raw, list):
                     # List of arrays (one per class)
@@ -420,8 +450,11 @@ def explain():
         records = _prepare_records(request.get_json(force=True, silent=False))
         df = _build_dataframe(records)
 
-        # Compute SHAP values
-        shap_values_raw = shap_explainer.shap_values(df.values)
+        # Compute SHAP values (optimized for production)
+        shap_values_raw = shap_explainer.shap_values(
+            df.values,
+            check_additivity=False  # Skip validation for speed
+        )
         
         # Handle different SHAP output formats
         # Format 1: List of arrays (one per class) - shape: [class][sample][feature]
