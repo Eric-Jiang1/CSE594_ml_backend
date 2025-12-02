@@ -124,7 +124,7 @@ if isinstance(model_dict, dict):
                     shap_explainer = shap.TreeExplainer(
                         raw_tree_model,
                         data=shap_background_reduced,
-                        feature_perturbation="tree_path_dependent"  # Fast SHAP mode (20-40x faster)
+                        feature_perturbation="interventional"  # Fast SHAP mode (20-40x faster)
                     )
                     print(f"Optimized SHAP explainer: reduced background from {shap_background.shape[0]} to {shap_background_reduced.shape[0]} samples with fast mode")
                 except Exception as e:
@@ -142,7 +142,7 @@ if isinstance(model_dict, dict):
                     shap_explainer = shap.TreeExplainer(
                         raw_tree_model,
                         data=shap_background,
-                        feature_perturbation="tree_path_dependent"  # Fast SHAP mode
+                        feature_perturbation="interventional"  # Fast SHAP mode
                     )
                     print("Enabled fast SHAP mode on existing explainer")
                 except Exception:
